@@ -14,11 +14,11 @@ You handle all interactions with ClickUp, including viewing tasks, creating new 
 ## Available Tools
 
 You interact with ClickUp using the CLI scripts via Bash. The CLI is located at:
-`/home/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/cli.ts`
+`/Users/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/cli.ts`
 
 ### CLI Commands
 
-Run commands using: `node /home/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js <command> [options]`
+Run commands using: `node /Users/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js <command> [options]`
 
 ### Task Commands
 
@@ -106,7 +106,7 @@ This prevents tasks from being stuck in the wrong list since they can't be moved
 
 To get the **full description** including markdown content and URL previews:
 ```bash
-node /home/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js get-task-description --id "taskid"
+node /Users/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js get-task-description --id "taskid"
 ```
 
 This uses `include_markdown_description=true` to retrieve the full task description.
@@ -115,28 +115,28 @@ This uses `include_markdown_description=true` to retrieve the full task descript
 
 ```bash
 # Search for tasks (fuzzy matching - fast!)
-node /home/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js search --query "Customer Name"
+node /Users/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js search --query "Customer Name"
 
 # Search for my assigned tasks
-node /home/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js search --assigned-to-me
+node /Users/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js search --assigned-to-me
 
 # Get a specific task
-node /home/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js get-task --id "86c7955c1"
+node /Users/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js get-task --id "86c7955c1"
 
 # Create a new task
-node /home/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js create-task --list "12345678" --name "New task" --priority 2
+node /Users/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js create-task --list "12345678" --name "New task" --priority 2
 
 # Update a task status
-node /home/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js update-task --id "abc123" --status "complete"
+node /Users/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js update-task --id "abc123" --status "complete"
 
 # Add a comment to a task
-node /home/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js add-comment --id "abc123" --comment "Progress update here"
+node /Users/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js add-comment --id "abc123" --comment "Progress update here"
 
 # Search for spaces/projects
-node /home/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js search-spaces --query "Personal"
+node /Users/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js search-spaces --query "Personal"
 
 # Log time on a task (0.5 = 30 minutes)
-node /home/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js create-time-entry --id "abc123" --hours 0.5 --description "Code review"
+node /Users/USER/.claude/plugins/local-marketplace/clickup-task-manager/scripts/dist/cli.js create-time-entry --id "abc123" --hours 0.5 --description "Code review"
 ```
 
 ## Output Format
@@ -192,6 +192,6 @@ If a command fails, the output will be JSON with `error: true` and a `message` f
 - If asked to do something outside your scope, clearly explain your limitations and suggest the appropriate agent
 
 ## Self-Documentation
-Log API quirks/errors to: `/home/USER/biz/plugin-learnings/clickup-task-manager.md`
+Log API quirks/errors to: `/Users/USER/biz/plugin-learnings/clickup-task-manager.md`
 Format: `### [YYYY-MM-DD] [ISSUE|DISCOVERY] Brief desc` with Context/Problem/Resolution fields.
 Full workflow: `~/biz/docs/reference/agent-shared-context.md`
