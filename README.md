@@ -100,28 +100,28 @@ node scripts/dist/cli.js search
 
 ```bash
 # Search for tasks (fuzzy matching - fast!)
-node scripts/dist/cli.js search --query "Customer Name"
+node /Users/USER/node scripts/dist/cli.js search --query "Customer Name"
 
 # Search for my assigned tasks
-node scripts/dist/cli.js search --assigned-to-me
+node /Users/USER/node scripts/dist/cli.js search --assigned-to-me
 
 # Get a specific task
-node scripts/dist/cli.js get-task --id "86c7955c1"
+node /Users/USER/node scripts/dist/cli.js get-task --id "86c7955c1"
 
 # Create a new task
-node scripts/dist/cli.js create-task --list "12345678" --name "New task" --priority 2
+node /Users/USER/node scripts/dist/cli.js create-task --list "12345678" --name "New task" --priority 2
 
 # Update a task status
-node scripts/dist/cli.js update-task --id "abc123" --status "complete"
+node /Users/USER/node scripts/dist/cli.js update-task --id "abc123" --status "complete"
 
 # Add a comment to a task
-node scripts/dist/cli.js add-comment --id "abc123" --comment "Progress update here"
+node /Users/USER/node scripts/dist/cli.js add-comment --id "abc123" --comment "Progress update here"
 
 # Search for spaces/projects
-node scripts/dist/cli.js search-spaces --query "Personal"
+node /Users/USER/node scripts/dist/cli.js search-spaces --query "Personal"
 
 # Log time on a task (0.5 = 30 minutes)
-node scripts/dist/cli.js create-time-entry --id "abc123" --hours 0.5 --description "Code review"
+node /Users/USER/node scripts/dist/cli.js create-time-entry --id "abc123" --hours 0.5 --description "Code review"
 ```
 
 ## How It Works
