@@ -31,7 +31,7 @@ ClickUp task management and sprint tracking
 ## Quick Start
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USER/claude-code-plugin-clickup.git
+git clone https://github.com/bigl34/claude-code-plugin-clickup.git
 cd claude-code-plugin-clickup
 cp config.template.json config.json  # fill in your credentials
 cd scripts && npm install
