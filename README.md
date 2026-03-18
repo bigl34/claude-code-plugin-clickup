@@ -3,7 +3,7 @@
 
 ClickUp task management and sprint tracking
 
-![Version](https://img.shields.io/badge/version-1.1.10-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
+![Version](https://img.shields.io/badge/version-1.2.0-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
 
 ## Features
 
@@ -49,14 +49,6 @@ node scripts/dist/cli.js search
    ```bash
    cd scripts && npm install
    ```
-
-## Configuration
-
-Copy `config.template.json` to `config.json` and fill in the required values:
-
-| Field | Placeholder |
-|-------|-------------|
-| `credentials_path` | `/path/to/your/credentials` |
 
 ## Available Commands
 
@@ -108,28 +100,28 @@ Copy `config.template.json` to `config.json` and fill in the required values:
 
 ```bash
 # Search for tasks (fuzzy matching - fast!)
-node /Users/USER/node scripts/dist/cli.js search --query "Customer Name"
+node $HOME/node scripts/dist/cli.js search --query "Customer Name"
 
 # Search for my assigned tasks
-node /Users/USER/node scripts/dist/cli.js search --assigned-to-me
+node $HOME/node scripts/dist/cli.js search --assigned-to-me
 
 # Get a specific task
-node /Users/USER/node scripts/dist/cli.js get-task --id "86c7955c1"
+node $HOME/node scripts/dist/cli.js get-task --id "86c7955c1"
 
 # Create a new task
-node /Users/USER/node scripts/dist/cli.js create-task --list "12345678" --name "New task" --priority 2
+node $HOME/node scripts/dist/cli.js create-task --list "12345678" --name "New task" --priority 2
 
 # Update a task status
-node /Users/USER/node scripts/dist/cli.js update-task --id "abc123" --status "complete"
+node $HOME/node scripts/dist/cli.js update-task --id "abc123" --status "complete"
 
 # Add a comment to a task
-node /Users/USER/node scripts/dist/cli.js add-comment --id "abc123" --comment "Progress update here"
+node $HOME/node scripts/dist/cli.js add-comment --id "abc123" --comment "Progress update here"
 
 # Search for spaces/projects
-node /Users/USER/node scripts/dist/cli.js search-spaces --query "Personal"
+node $HOME/node scripts/dist/cli.js search-spaces --query "Personal"
 
 # Log time on a task (0.5 = 30 minutes)
-node /Users/USER/node scripts/dist/cli.js create-time-entry --id "abc123" --hours 0.5 --description "Code review"
+node $HOME/node scripts/dist/cli.js create-time-entry --id "abc123" --hours 0.5 --description "Code review"
 ```
 
 ## How It Works
