@@ -1,36 +1,167 @@
-/**
- * ClickUp API Client
- *
- * Direct client for the ClickUp REST API v2.
- * Handles workspaces (teams), spaces, folders, lists, and tasks.
- * Configuration from config.json with API key and team ID.
- *
- * Key features:
- * - Full task CRUD operations
- * - Workspace hierarchy navigation (spaces → folders → lists → tasks)
- * - Time tracking entries
- * - Task comments
- * - Flexible search with status/assignee/date filters
- */
 
-import { readFileSync } from "fs";
-import { fileURLToPath } from "url";
-import { dirname, join } from "path";
+import {
+  loadServiceConfig,
+  normalizeLegacyMcpConfig,
+  z,
+} from "@local/cli-utils";
 import { PluginCache, TTL, createCacheKey } from "@local/plugin-cache";
+import {
+  DEFAULT_RETRY_CONFIG,
+  calculateBackoff,
+  fetchWithRetry,
+  isPreSendNetworkError,
+  isRetryableError,
+  parseRetryAfterMs,
+  withRetry,
+} from "./vendor/retry/index.js";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const ClickupConfigSchema = z.object({
+  clickup: z.object({
+    apiKey: z.string().min(1),
+    teamId: z.string().min(1),
+  }),
+});
+
+const RETRYABLE_HTTP_STATUSES = new Set(
+  DEFAULT_RETRY_CONFIG.retryableErrors
+    .filter((pattern) => /^\d+$/.test(pattern))
+    .map((pattern) => Number(pattern))
+);
+const IDEMPOTENT_METHODS = new Set(["GET", "HEAD", "PUT", "DELETE", "OPTIONS"]);
+const NON_IDEMPOTENT_RETRYABLE_STATUSES = new Set([429]);
+const SINGLE_FETCH_CONFIG = {
+  maxRetries: 0,
+  retryableErrors: [],
+  logger: () => {},
+};
+
+const MAX_IN_PROCESS_RATE_LIMIT_WAIT_MS = 30_000;
+const EPOCH_MILLISECONDS_THRESHOLD = 1_000_000_000_000;
+const HTTP_DATE_PREFIX = /^(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), |(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), |(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) )/i;
+
+export type ClickUpRateLimitResumeSource =
+  | "x-rate-limit-reset"
+  | "retry-after"
+  | "exponential-backoff";
+
+export interface ClickUpRateLimitResumeState {
+  source: ClickUpRateLimitResumeSource;
+  retryAfterMs: number;
+  resumeAtMs: number;
+}
+
+export class ClickUpRateLimitError extends Error {
+  readonly status = 429;
+  readonly retryAfterMs: number;
+  readonly resumeState: ClickUpRateLimitResumeState;
+
+  constructor(resumeState: ClickUpRateLimitResumeState) {
+    super(
+      `ClickUp rate limit: ${resumeState.source} requires another ${Math.ceil(resumeState.retryAfterMs / 1000)}s cooldown, ` +
+        `which exceeds the ${MAX_IN_PROCESS_RATE_LIMIT_WAIT_MS / 1000}s in-process wait limit. ` +
+        `Resume at or after ${new Date(resumeState.resumeAtMs).toISOString()}.`
+    );
+    this.name = "ClickUpRateLimitError";
+    this.retryAfterMs = resumeState.retryAfterMs;
+    this.resumeState = resumeState;
+  }
+}
+
+function parseRateLimitResetAtMs(value: string | null): number | undefined {
+  const normalized = value?.trim();
+  if (!normalized || !/^\d+$/.test(normalized)) return undefined;
+
+  const numericValue = Number(normalized);
+  if (!Number.isSafeInteger(numericValue)) return undefined;
+
+  const resetAtMs = numericValue >= EPOCH_MILLISECONDS_THRESHOLD
+    ? numericValue
+    : numericValue * 1000;
+  return Number.isSafeInteger(resetAtMs) && Number.isFinite(new Date(resetAtMs).getTime())
+    ? resetAtMs
+    : undefined;
+}
+
+function parseValidRetryAfterMs(value: string | null, nowMs: number): number | undefined {
+  const normalized = value?.trim();
+  if (!normalized) return undefined;
+
+  if (!/^\d+$/.test(normalized) && !HTTP_DATE_PREFIX.test(normalized)) {
+    return undefined;
+  }
+  if (/^\d+$/.test(normalized) && !Number.isSafeInteger(Number(normalized))) {
+    return undefined;
+  }
+
+  const retryAfterMs = parseRetryAfterMs(normalized);
+  if (
+    retryAfterMs === undefined ||
+    !Number.isSafeInteger(retryAfterMs) ||
+    !Number.isFinite(new Date(nowMs + retryAfterMs).getTime())
+  ) {
+    return undefined;
+  }
+  return retryAfterMs;
+}
+
+function rateLimitResumeState(headers: Headers, nowMs = Date.now()): ClickUpRateLimitResumeState | undefined {
+  const providerResetAtMs = parseRateLimitResetAtMs(headers.get("x-ratelimit-reset"));
+  if (providerResetAtMs !== undefined) {
+    return {
+      source: "x-rate-limit-reset",
+      retryAfterMs: Math.max(0, providerResetAtMs - nowMs),
+      resumeAtMs: providerResetAtMs,
+    };
+  }
+
+  const retryAfterMs = parseValidRetryAfterMs(headers.get("retry-after"), nowMs);
+  if (retryAfterMs === undefined) return undefined;
+  return {
+    source: "retry-after",
+    retryAfterMs,
+    resumeAtMs: nowMs + retryAfterMs,
+  };
+}
+
+function isOverBudgetRateLimit(error: unknown): error is ClickUpRateLimitError {
+  return error instanceof ClickUpRateLimitError;
+}
+
+function retryDelayFromError(error: unknown): number | undefined {
+  const candidate = error as {
+    status?: number;
+    rateLimitResumeState?: ClickUpRateLimitResumeState;
+  } | null | undefined;
+  return candidate?.status === 429
+    ? candidate.rateLimitResumeState?.retryAfterMs
+    : undefined;
+}
+
+function abortableSleep(ms: number, signal?: AbortSignal | null): Promise<void> {
+  if (!signal) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  if (signal.aborted) {
+    return Promise.reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+  }
+
+  return new Promise((resolve, reject) => {
+    const pending: { timeoutId?: ReturnType<typeof setTimeout> } = {};
+    const onAbort = () => {
+      if (pending.timeoutId !== undefined) clearTimeout(pending.timeoutId);
+      reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    pending.timeoutId = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+  });
+}
 
 interface ClickUpConfig {
   apiKey: string;
   teamId: string;
-}
-
-interface ConfigFile {
-  clickup: {
-    apiKey: string;
-    teamId: string;
-  };
 }
 
 interface Space {
@@ -109,6 +240,7 @@ interface Task {
   start_date?: string;
   time_estimate?: number;
   time_spent?: number;
+  points?: number | null;
   custom_fields?: any[];
   list: { id: string; name: string };
   folder?: { id: string; name: string };
@@ -150,7 +282,22 @@ interface ListResponse<T> {
   comments?: T[];
 }
 
-// Initialize cache with namespace
+export interface FolderTaskInventory {
+  folderId: string;
+  listCount: number;
+  totalTasksReturned: number;
+  activeTasks: Task[];
+}
+
+const CLICKUP_TASK_PAGE_SIZE = 100;
+const INACTIVE_TASK_STATUSES = new Set(["done", "closed", "complete", "completed"]);
+
+function isActiveTask(task: Task): boolean {
+  const status = task.status?.status?.trim().toLowerCase();
+  const statusType = task.status?.type?.trim().toLowerCase();
+  return !INACTIVE_TASK_STATUSES.has(status) && !INACTIVE_TASK_STATUSES.has(statusType);
+}
+
 const cache = new PluginCache({
   namespace: "clickup-task-manager",
   defaultTTL: TTL.FIVE_MINUTES,
@@ -162,99 +309,49 @@ export class ClickUpClient {
   private cacheDisabled: boolean = false;
 
   constructor() {
-    const configPath = join(__dirname, "..", "config.json");
-    const rawConfig = JSON.parse(readFileSync(configPath, "utf-8"));
-
-    // Support both formats: { clickup: { apiKey, teamId } } and { mcpServer: { env: { CLICKUP_API_KEY, CLICKUP_TEAM_ID } } }
-    let apiKey: string | undefined;
-    let teamId: string | undefined;
-
-    if (rawConfig.clickup) {
-      // New format
-      apiKey = rawConfig.clickup.apiKey;
-      teamId = rawConfig.clickup.teamId;
-    } else if (rawConfig.mcpServer?.env) {
-      // Legacy MCP format
-      apiKey = rawConfig.mcpServer.env.CLICKUP_API_KEY;
-      teamId = rawConfig.mcpServer.env.CLICKUP_TEAM_ID || rawConfig.teamId;
-    }
-
-    if (!apiKey || !teamId) {
-      throw new Error(
-        "Missing required config in config.json: clickup.apiKey, clickup.teamId"
-      );
-    }
-
-    this.config = { apiKey, teamId };
+    const raw = loadServiceConfig("clickup-task-manager");
+    const normalized = normalizeLegacyMcpConfig(
+      raw,
+      {
+        "clickup.apiKey": "CLICKUP_API_KEY",
+        "clickup.teamId": "CLICKUP_TEAM_ID",
+      },
+      {
+        legacyTopLevel: { "clickup.teamId": "teamId" },
+      },
+    );
+    const config = ClickupConfigSchema.parse(normalized);
+    this.config = config.clickup;
   }
 
-  // ============================================
-  // CACHE CONTROL
-  // ============================================
 
-  /**
-   * Disables caching for all subsequent requests.
-   * Useful for debugging or when fresh data is required.
-   */
   disableCache(): void {
     this.cacheDisabled = true;
     cache.disable();
   }
 
-  /**
-   * Re-enables caching after it was disabled.
-   */
   enableCache(): void {
     this.cacheDisabled = false;
     cache.enable();
   }
 
-  /**
-   * Returns cache statistics including hit/miss counts.
-   * @returns Cache stats object with hits, misses, and entry count
-   */
   getCacheStats() {
     return cache.getStats();
   }
 
-  /**
-   * Clears all cached data.
-   * @returns Number of cache entries cleared
-   */
   clearCache(): number {
     return cache.clear();
   }
 
-  /**
-   * Invalidates a specific cache entry by key.
-   * @param key - The cache key to invalidate
-   * @returns true if entry was found and removed, false otherwise
-   */
   invalidateCacheKey(key: string): boolean {
     return cache.invalidate(key);
   }
 
-  /**
-   * Gets the configured team (workspace) ID.
-   * @returns ClickUp team ID from config
-   */
   get teamId(): string {
     return this.config.teamId;
   }
 
-  // ============================================
-  // HTTP LAYER
-  // ============================================
 
-  /**
-   * Makes an HTTP request to the ClickUp API.
-   *
-   * @param method - HTTP method (GET, POST, PUT, DELETE)
-   * @param endpoint - API endpoint path
-   * @param body - Request body for POST/PUT
-   * @returns Parsed JSON response
-   * @throws {Error} If API returns non-2xx status
-   */
   private async request<T>(
     method: string,
     endpoint: string,
@@ -276,7 +373,11 @@ export class ClickUpClient {
       options.body = JSON.stringify(body);
     }
 
-    const response = await fetch(url, options);
+    const isIdempotent = IDEMPOTENT_METHODS.has(method.toUpperCase());
+    const retryableStatuses = isIdempotent
+      ? RETRYABLE_HTTP_STATUSES
+      : NON_IDEMPOTENT_RETRYABLE_STATUSES;
+    const response = await this.fetchResponseWithRetry(url, options, retryableStatuses, isIdempotent);
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -286,25 +387,120 @@ export class ClickUpClient {
     return response.json() as Promise<T>;
   }
 
-  // ============================================
-  // SPACE OPERATIONS
-  // ============================================
+  private async fetchResponseWithRetry(
+    url: string,
+    options: RequestInit,
+    retryableStatuses: Set<number>,
+    idempotent: boolean
+  ): Promise<Response> {
+    let lastRetryableResponse: Response | undefined;
+    let inProcessRateLimitWaitMs = 0;
 
-  /**
-   * Lists all spaces in the workspace.
-   *
-   * Spaces are the top-level organizational unit in ClickUp.
-   *
-   * @returns Array of space objects with id, name, statuses, and features
-   *
-   * @cached TTL: 1 hour
-   *
-   * @example
-   * const spaces = await client.getSpaces();
-   * for (const space of spaces) {
-   *   console.log(space.name, space.id);
-   * }
-   */
+    const shouldRetryIdempotent = (error: unknown) =>
+      !isOverBudgetRateLimit(error) &&
+      isRetryableError(error, DEFAULT_RETRY_CONFIG.retryableErrors);
+    const shouldRetryNonIdempotent = (error: unknown) =>
+      !isOverBudgetRateLimit(error) &&
+      ((error as { status?: number })?.status === 429 || isPreSendNetworkError(error));
+    const nextDelayMs = ({
+      attempt,
+      error,
+      baseDelayMs,
+      maxDelayMs,
+    }: {
+      attempt: number;
+      error: unknown;
+      baseDelayMs: number;
+      maxDelayMs: number;
+    }) => {
+      const rateLimitState = (error as {
+        status?: number;
+        rateLimitResumeState?: ClickUpRateLimitResumeState;
+      } | null | undefined)?.rateLimitResumeState;
+      const providerDelayMs = retryDelayFromError(error);
+      const delayMs = providerDelayMs === undefined || providerDelayMs <= 0
+        ? calculateBackoff(attempt, {
+            baseDelayMs,
+            maxDelayMs,
+            jitterPercent: DEFAULT_RETRY_CONFIG.jitterPercent,
+          })
+        : providerDelayMs;
+
+      if ((error as { status?: number } | null | undefined)?.status === 429) {
+        if (inProcessRateLimitWaitMs + delayMs > MAX_IN_PROCESS_RATE_LIMIT_WAIT_MS) {
+          throw new ClickUpRateLimitError(
+            rateLimitState && providerDelayMs !== undefined && providerDelayMs > 0
+              ? rateLimitState
+              : {
+                  source: "exponential-backoff",
+                  retryAfterMs: delayMs,
+                  resumeAtMs: Date.now() + delayMs,
+                }
+          );
+        }
+        inProcessRateLimitWaitMs += delayMs;
+      }
+
+      if (providerDelayMs !== undefined && providerDelayMs > 0) {
+        console.error(
+          `[clickup] rate limited; honouring ${rateLimitState?.source ?? "provider cooldown"} for ` +
+            `${Math.ceil(providerDelayMs / 1000)}s before attempt ${attempt + 2}`
+        );
+      }
+      return delayMs;
+    };
+
+    const outerConfig = idempotent
+      ? { logger: () => {}, shouldRetry: shouldRetryIdempotent, nextDelayMs, sleepImpl: (ms: number) => abortableSleep(ms, options.signal) }
+      : { logger: () => {}, shouldRetry: shouldRetryNonIdempotent, nextDelayMs, sleepImpl: (ms: number) => abortableSleep(ms, options.signal) };
+
+    const result = await withRetry(
+      async () => {
+        const response = await fetchWithRetry(url, options, SINGLE_FETCH_CONFIG);
+        if (!response.ok && retryableStatuses.has(response.status)) {
+          lastRetryableResponse = response.clone();
+
+          const resumeState = response.status === 429
+            ? rateLimitResumeState(response.headers)
+            : undefined;
+          if (
+            resumeState !== undefined &&
+            inProcessRateLimitWaitMs + resumeState.retryAfterMs >
+              MAX_IN_PROCESS_RATE_LIMIT_WAIT_MS
+          ) {
+            throw new ClickUpRateLimitError(resumeState);
+          }
+
+          const error = new Error(`HTTP ${response.status}: ${response.statusText}`);
+          (error as Error & { status?: number }).status = response.status;
+          if (resumeState !== undefined) {
+            (error as Error & {
+              rateLimitResumeState?: ClickUpRateLimitResumeState;
+            }).rateLimitResumeState = resumeState;
+          }
+          throw error;
+        }
+        return response;
+      },
+      outerConfig
+    );
+
+    if (result.success) {
+      return result.data as Response;
+    }
+
+    if (isOverBudgetRateLimit(result.error)) {
+      throw result.error;
+    }
+
+    if (lastRetryableResponse) {
+      return lastRetryableResponse;
+    }
+
+    throw result.error || new Error("ClickUp API request failed after retries");
+  }
+
+
   async getSpaces(): Promise<Space[]> {
     return cache.getOrFetch(
       "spaces",
@@ -319,14 +515,6 @@ export class ClickUpClient {
     );
   }
 
-  /**
-   * Gets a single space by ID.
-   *
-   * @param spaceId - ClickUp space ID
-   * @returns Space object with full details
-   *
-   * @cached TTL: 1 hour
-   */
   async getSpace(spaceId: string): Promise<Space> {
     const cacheKey = createCacheKey("space", { id: spaceId });
     return cache.getOrFetch(
@@ -336,20 +524,7 @@ export class ClickUpClient {
     );
   }
 
-  // ============================================
-  // FOLDER OPERATIONS
-  // ============================================
 
-  /**
-   * Lists all folders in a space.
-   *
-   * Folders are optional organizational containers between spaces and lists.
-   *
-   * @param spaceId - ClickUp space ID
-   * @returns Array of folder objects with lists inside
-   *
-   * @cached TTL: 15 minutes
-   */
   async getFolders(spaceId: string): Promise<Folder[]> {
     const cacheKey = createCacheKey("folders", { space: spaceId });
     return cache.getOrFetch(
@@ -365,19 +540,11 @@ export class ClickUpClient {
     );
   }
 
-  // ============================================
-  // LIST OPERATIONS
-  // ============================================
 
-  /**
-   * Lists all lists in a folder.
-   *
-   * @param folderId - ClickUp folder ID
-   * @returns Array of list objects
-   *
-   * @cached TTL: 15 minutes
-   */
-  async getLists(folderId: string): Promise<List[]> {
+  async getLists(
+    folderId: string,
+    options?: { bypassCache?: boolean }
+  ): Promise<List[]> {
     const cacheKey = createCacheKey("lists", { folder: folderId });
     return cache.getOrFetch(
       cacheKey,
@@ -388,20 +555,13 @@ export class ClickUpClient {
         );
         return result.lists || [];
       },
-      { ttl: TTL.FIFTEEN_MINUTES, bypassCache: this.cacheDisabled }
+      {
+        ttl: TTL.FIFTEEN_MINUTES,
+        bypassCache: this.cacheDisabled || options?.bypassCache,
+      }
     );
   }
 
-  /**
-   * Lists folderless lists directly in a space.
-   *
-   * Some lists exist directly under a space without being in a folder.
-   *
-   * @param spaceId - ClickUp space ID
-   * @returns Array of list objects not in any folder
-   *
-   * @cached TTL: 15 minutes
-   */
   async getFolderlessLists(spaceId: string): Promise<List[]> {
     const cacheKey = createCacheKey("folderless_lists", { space: spaceId });
     return cache.getOrFetch(
@@ -417,14 +577,6 @@ export class ClickUpClient {
     );
   }
 
-  /**
-   * Gets a single list by ID.
-   *
-   * @param listId - ClickUp list ID
-   * @returns List object with details and statuses
-   *
-   * @cached TTL: 15 minutes
-   */
   async getList(listId: string): Promise<List> {
     const cacheKey = createCacheKey("list", { id: listId });
     return cache.getOrFetch(
@@ -434,43 +586,7 @@ export class ClickUpClient {
     );
   }
 
-  // ============================================
-  // TASK OPERATIONS
-  // ============================================
 
-  /**
-   * Lists tasks in a list with optional filtering.
-   *
-   * Supports extensive filtering by status, assignee, and date ranges.
-   * Results are paginated (100 per page).
-   *
-   * @param listId - ClickUp list ID
-   * @param options - Filter options
-   * @param options.archived - Include archived tasks
-   * @param options.include_closed - Include closed tasks
-   * @param options.page - Page number (0-indexed)
-   * @param options.order_by - Sort field (e.g., "created", "updated", "due_date")
-   * @param options.reverse - Reverse sort order
-   * @param options.subtasks - Include subtasks
-   * @param options.statuses - Filter by status names
-   * @param options.assignees - Filter by assignee user IDs
-   * @param options.due_date_gt - Due date after (Unix ms)
-   * @param options.due_date_lt - Due date before (Unix ms)
-   * @param options.date_created_gt - Created after (Unix ms)
-   * @param options.date_created_lt - Created before (Unix ms)
-   * @param options.date_updated_gt - Updated after (Unix ms)
-   * @param options.date_updated_lt - Updated before (Unix ms)
-   * @returns Array of task objects
-   *
-   * @cached TTL: 5 minutes
-   *
-   * @example
-   * // Get open tasks due this week
-   * const tasks = await client.getTasks("list123", {
-   *   include_closed: false,
-   *   due_date_lt: Date.now() + 7 * 24 * 60 * 60 * 1000
-   * });
-   */
   async getTasks(
     listId: string,
     options?: {
@@ -488,9 +604,9 @@ export class ClickUpClient {
       date_created_lt?: number;
       date_updated_gt?: number;
       date_updated_lt?: number;
-    }
+    },
+    requestOptions?: { bypassCache?: boolean }
   ): Promise<Task[]> {
-    // Convert arrays to strings for cache key
     const cacheParams: Record<string, string | number | boolean | undefined> = {
       list: listId,
       archived: options?.archived,
@@ -536,23 +652,47 @@ export class ClickUpClient {
         const result = await this.request<{ tasks: Task[] }>("GET", endpoint);
         return result.tasks || [];
       },
-      { ttl: TTL.FIVE_MINUTES, bypassCache: this.cacheDisabled }
+      {
+        ttl: TTL.FIVE_MINUTES,
+        bypassCache: this.cacheDisabled || requestOptions?.bypassCache,
+      }
     );
   }
 
-  /**
-   * Gets a single task by ID.
-   *
-   * @param taskId - ClickUp task ID
-   * @param includeMarkdown - Include markdown description (default: false)
-   * @returns Task object with full details
-   *
-   * @cached TTL: 5 minutes
-   *
-   * @example
-   * const task = await client.getTask("abc123", true);
-   * console.log(task.name, task.markdown_description);
-   */
+  async getFolderTasks(folderId: string): Promise<FolderTaskInventory> {
+    const lists = await this.getLists(folderId, { bypassCache: true });
+    const activeTasks: Task[] = [];
+    let totalTasksReturned = 0;
+
+    for (const list of lists) {
+      let page = 0;
+      let pageTasks: Task[];
+
+      do {
+        pageTasks = await this.getTasks(
+          list.id,
+          {
+            archived: false,
+            include_closed: false,
+            page,
+            subtasks: true,
+          },
+          { bypassCache: true },
+        );
+        totalTasksReturned += pageTasks.length;
+        activeTasks.push(...pageTasks.filter(isActiveTask));
+        page++;
+      } while (pageTasks.length === CLICKUP_TASK_PAGE_SIZE);
+    }
+
+    return {
+      folderId,
+      listCount: lists.length,
+      totalTasksReturned,
+      activeTasks,
+    };
+  }
+
   async getTask(taskId: string, includeMarkdown = false): Promise<Task> {
     const cacheKey = createCacheKey("task", { id: taskId, markdown: includeMarkdown });
 
@@ -566,30 +706,6 @@ export class ClickUpClient {
     );
   }
 
-  /**
-   * Searches tasks across the workspace.
-   *
-   * Searches by task name and optionally filters by location and status.
-   *
-   * @param query - Search query text
-   * @param options - Filter options
-   * @param options.include_closed - Include closed tasks
-   * @param options.assigned_to_me - Only tasks assigned to authenticated user
-   * @param options.list_ids - Filter to specific lists
-   * @param options.space_ids - Filter to specific spaces
-   * @param options.folder_ids - Filter to specific folders
-   * @param options.statuses - Filter by status names
-   * @param options.page - Page number (0-indexed)
-   * @returns Array of matching task objects
-   *
-   * @cached TTL: 5 minutes
-   *
-   * @example
-   * // Search for shipping-related tasks
-   * const tasks = await client.searchTasks("shipping", {
-   *   include_closed: false
-   * });
-   */
   async searchTasks(
     query: string,
     options?: {
@@ -600,9 +716,12 @@ export class ClickUpClient {
       folder_ids?: string[];
       statuses?: string[];
       page?: number;
+      date_updated_gt?: number;
+      date_updated_lt?: number;
+      order_by?: "id" | "created" | "updated" | "due_date";
+      reverse?: boolean;
     }
   ): Promise<Task[]> {
-    // Convert arrays to strings for cache key
     const cacheParams: Record<string, string | number | boolean | undefined> = {
       query,
       include_closed: options?.include_closed,
@@ -612,6 +731,10 @@ export class ClickUpClient {
       folder_ids: options?.folder_ids?.join(","),
       statuses: options?.statuses?.join(","),
       page: options?.page,
+      date_updated_gt: options?.date_updated_gt,
+      date_updated_lt: options?.date_updated_lt,
+      order_by: options?.order_by,
+      reverse: options?.reverse,
     };
     const cacheKey = createCacheKey("search", cacheParams);
 
@@ -623,6 +746,10 @@ export class ClickUpClient {
         if (query) params.set("query", query);
         if (options?.include_closed) params.set("include_closed", "true");
         if (options?.page !== undefined) params.set("page", String(options.page));
+        if (options?.date_updated_gt !== undefined) params.set("date_updated_gt", String(options.date_updated_gt));
+        if (options?.date_updated_lt !== undefined) params.set("date_updated_lt", String(options.date_updated_lt));
+        if (options?.order_by !== undefined) params.set("order_by", options.order_by);
+        if (options?.reverse !== undefined) params.set("reverse", String(options.reverse));
         if (options?.list_ids) options.list_ids.forEach(id => params.append("list_ids[]", id));
         if (options?.space_ids) options.space_ids.forEach(id => params.append("space_ids[]", id));
         if (options?.folder_ids) options.folder_ids.forEach(id => params.append("folder_ids[]", id));
@@ -638,43 +765,7 @@ export class ClickUpClient {
     );
   }
 
-  // ============================================
-  // TASK MUTATIONS
-  // ============================================
 
-  /**
-   * Creates a new task in a list.
-   *
-   * @param listId - ClickUp list ID
-   * @param data - Task data
-   * @param data.name - Task name (required)
-   * @param data.description - Plain text description
-   * @param data.markdown_description - Markdown description
-   * @param data.assignees - Array of user IDs to assign
-   * @param data.tags - Array of tag names
-   * @param data.status - Status name
-   * @param data.priority - Priority (1=urgent, 2=high, 3=normal, 4=low)
-   * @param data.due_date - Due date (Unix ms)
-   * @param data.due_date_time - Whether due date includes time
-   * @param data.start_date - Start date (Unix ms)
-   * @param data.start_date_time - Whether start date includes time
-   * @param data.notify_all - Notify all assignees
-   * @param data.parent - Parent task ID for subtasks
-   * @param data.links_to - Task ID to link to
-   * @param data.check_required_custom_fields - Validate required custom fields
-   * @param data.custom_fields - Custom field values
-   * @returns Created task object
-   *
-   * @invalidates tasks/*, search/*
-   *
-   * @example
-   * const task = await client.createTask("list123", {
-   *   name: "Review shipping rates",
-   *   description: "Compare carrier rates for Q1",
-   *   priority: 2,
-   *   due_date: Date.now() + 7 * 24 * 60 * 60 * 1000
-   * });
-   */
   async createTask(
     listId: string,
     data: {
@@ -702,39 +793,6 @@ export class ClickUpClient {
     return result;
   }
 
-  /**
-   * Updates an existing task.
-   *
-   * Only provided fields are updated; others remain unchanged.
-   *
-   * @param taskId - ClickUp task ID
-   * @param data - Fields to update
-   * @param data.name - New task name
-   * @param data.description - Plain text description
-   * @param data.markdown_description - Markdown description
-   * @param data.assignees - Assignee changes { add: [], rem: [] }
-   * @param data.status - New status name
-   * @param data.priority - Priority (1=urgent, 2=high, 3=normal, 4=low)
-   * @param data.due_date - Due date (Unix ms), null to clear
-   * @param data.due_date_time - Whether due date includes time
-   * @param data.start_date - Start date (Unix ms)
-   * @param data.start_date_time - Whether start date includes time
-   * @param data.parent - Parent task ID
-   * @param data.time_estimate - Time estimate in ms
-   * @param data.archived - Archive/unarchive task
-   * @param data.list_id - Move to different list
-   * @returns Updated task object
-   *
-   * @invalidates task/{taskId}, tasks/*, search/*
-   *
-   * @example
-   * // Mark task complete
-   * await client.updateTask("abc123", { status: "complete" });
-   *
-   * @example
-   * // Add assignee
-   * await client.updateTask("abc123", { assignees: { add: [12345] } });
-   */
   async updateTask(
     taskId: string,
     data: {
@@ -750,6 +808,7 @@ export class ClickUpClient {
       start_date_time?: boolean;
       parent?: string;
       time_estimate?: number;
+      points?: number;
       archived?: boolean;
       list_id?: string;
     }
@@ -762,34 +821,13 @@ export class ClickUpClient {
     return result;
   }
 
-  /**
-   * Deletes a task.
-   *
-   * @param taskId - ClickUp task ID
-   *
-   * @invalidates task/*, search/*
-   */
   async deleteTask(taskId: string): Promise<void> {
     await this.request<{}>("DELETE", `/task/${taskId}`);
     cache.invalidatePattern(/^task/);
     cache.invalidatePattern(/^search/);
   }
 
-  // ============================================
-  // COMMENT OPERATIONS
-  // ============================================
 
-  /**
-   * Gets comments on a task.
-   *
-   * @param taskId - ClickUp task ID
-   * @param options - Pagination options
-   * @param options.start - Start timestamp for pagination
-   * @param options.start_id - Start comment ID for pagination
-   * @returns Array of comment objects
-   *
-   * @cached TTL: 5 minutes
-   */
   async getTaskComments(taskId: string, options?: { start?: number; start_id?: string }): Promise<Comment[]> {
     const cacheKey = createCacheKey("comments", { task: taskId, ...options });
 
@@ -810,19 +848,6 @@ export class ClickUpClient {
     );
   }
 
-  /**
-   * Adds a comment to a task.
-   *
-   * @param taskId - ClickUp task ID
-   * @param commentText - Comment text content
-   * @param notifyAll - Notify all task watchers (default: false)
-   * @returns Created comment object
-   *
-   * @invalidates comments/{taskId}
-   *
-   * @example
-   * await client.addComment("abc123", "Shipping labels created", true);
-   */
   async addComment(taskId: string, commentText: string, notifyAll = false): Promise<Comment> {
     const result = await this.request<Comment>("POST", `/task/${taskId}/comment`, {
       comment_text: commentText,
@@ -832,36 +857,7 @@ export class ClickUpClient {
     return result;
   }
 
-  // ============================================
-  // TIME TRACKING OPERATIONS
-  // ============================================
 
-  /**
-   * Gets time tracking entries.
-   *
-   * Can be filtered by date range, assignee, or location (space/folder/list/task).
-   *
-   * @param options - Filter options
-   * @param options.start_date - Start of date range (Unix ms)
-   * @param options.end_date - End of date range (Unix ms)
-   * @param options.assignee - Filter by user ID
-   * @param options.include_task_tags - Include task tags in response
-   * @param options.include_location_names - Include space/folder/list names
-   * @param options.space_id - Filter to specific space
-   * @param options.folder_id - Filter to specific folder
-   * @param options.list_id - Filter to specific list
-   * @param options.task_id - Filter to specific task
-   * @returns Array of time entry objects
-   *
-   * @cached TTL: 5 minutes
-   *
-   * @example
-   * // Get this week's time entries
-   * const entries = await client.getTimeEntries({
-   *   start_date: weekStart.getTime(),
-   *   end_date: Date.now()
-   * });
-   */
   async getTimeEntries(options?: {
     start_date?: number;
     end_date?: number;
@@ -900,28 +896,6 @@ export class ClickUpClient {
     );
   }
 
-  /**
-   * Creates a time tracking entry.
-   *
-   * @param taskId - ClickUp task ID to log time against
-   * @param data - Time entry data
-   * @param data.start - Start time (Unix ms)
-   * @param data.duration - Duration in milliseconds
-   * @param data.description - Description of work done
-   * @param data.tags - Tag names
-   * @param data.billable - Whether time is billable
-   * @returns Created time entry object
-   *
-   * @invalidates time_entries/*
-   *
-   * @example
-   * // Log 2 hours of work
-   * await client.createTimeEntry("abc123", {
-   *   start: Date.now() - 2 * 60 * 60 * 1000,
-   *   duration: 2 * 60 * 60 * 1000,
-   *   description: "Shipping integration work"
-   * });
-   */
   async createTimeEntry(
     taskId: string,
     data: {
@@ -932,7 +906,7 @@ export class ClickUpClient {
       billable?: boolean;
     }
   ): Promise<TimeEntry> {
-    const result = await this.request<TimeEntry>(
+    const result = await this.request<{ data: TimeEntry }>(
       "POST",
       `/team/${this.config.teamId}/time_entries`,
       {
@@ -940,21 +914,14 @@ export class ClickUpClient {
         tid: taskId,
       }
     );
+    if (!result?.data) {
+      throw new Error("ClickUp create-time-entry response did not contain a data entry");
+    }
     cache.invalidatePattern(/^time_entries/);
-    return result;
+    return result.data;
   }
 
-  // ============================================
-  // USER OPERATIONS
-  // ============================================
 
-  /**
-   * Gets the authenticated user's details.
-   *
-   * @returns User object for the API key owner
-   *
-   * @cached TTL: 1 hour
-   */
   async getAuthorizedUser(): Promise<User> {
     return cache.getOrFetch(
       "authorized_user",
@@ -966,13 +933,6 @@ export class ClickUpClient {
     );
   }
 
-  /**
-   * Gets all team members in the workspace.
-   *
-   * @returns Array of user objects
-   *
-   * @cached TTL: 1 hour
-   */
   async getTeamMembers(): Promise<User[]> {
     return cache.getOrFetch(
       "team_members",
@@ -987,21 +947,7 @@ export class ClickUpClient {
     );
   }
 
-  // ============================================
-  // HELPER METHODS
-  // ============================================
 
-  /**
-   * Searches spaces by name.
-   *
-   * Client-side filtering of getSpaces() results.
-   *
-   * @param query - Optional search query (case-insensitive)
-   * @returns Array of matching spaces
-   *
-   * @example
-   * const spaces = await client.searchSpaces("operations");
-   */
   async searchSpaces(query?: string): Promise<Space[]> {
     const spaces = await this.getSpaces();
     if (!query) return spaces;
@@ -1010,20 +956,6 @@ export class ClickUpClient {
     return spaces.filter(s => s.name.toLowerCase().includes(lowerQuery));
   }
 
-  /**
-   * Gets all lists across all spaces and folders.
-   *
-   * Traverses the full workspace hierarchy to collect all lists.
-   * Each list includes spaceName and folderName for context.
-   *
-   * @returns Array of lists with space/folder context
-   *
-   * @example
-   * const lists = await client.getAllLists();
-   * for (const list of lists) {
-   *   console.log(`${list.spaceName} / ${list.folderName || ''} / ${list.name}`);
-   * }
-   */
   async getAllLists(): Promise<Array<List & { spaceName?: string; folderName?: string }>> {
     const spaces = await this.getSpaces();
     const allLists: Array<List & { spaceName?: string; folderName?: string }> = [];
@@ -1046,23 +978,21 @@ export class ClickUpClient {
     return allLists;
   }
 
-  /**
-   * Returns list of available CLI commands for this client.
-   * Used for CLI help text generation.
-   *
-   * @returns Array of tool definitions with name and description
-   */
   getTools(): Array<{ name: string; description: string }> {
     return [
       { name: "search", description: "Search for tasks by query" },
       { name: "get-task", description: "Get a specific task by ID" },
       { name: "get-task-description", description: "Get task with full markdown description" },
       { name: "create-task", description: "Create a new task in a list" },
+      { name: "create-sprint-task", description: "Create a new task in the current User To Dos sprint" },
       { name: "update-task", description: "Update an existing task" },
       { name: "add-comment", description: "Add a comment to a task" },
       { name: "get-comments", description: "Get comments on a task" },
       { name: "search-spaces", description: "Search/list spaces" },
       { name: "get-list", description: "Get list details" },
+      { name: "list-lists", description: "List ClickUp lists with IDs and folder/date metadata" },
+      { name: "list-folder-tasks", description: "List all active tasks across every list in a folder" },
+      { name: "current-sprint", description: "Resolve the current User To Dos sprint list" },
       { name: "get-time-entries", description: "Get time tracking entries" },
       { name: "create-time-entry", description: "Log time to a task" },
       { name: "cache-stats", description: "Show cache statistics" },
