@@ -1,7 +1,6 @@
 ---
 name: clickup-task-manager
 description: Use this agent when you need to interact with ClickUp for task management, including viewing tasks, creating new tasks, updating task status, managing sprints, or searching for tasks. This agent handles all ClickUp operations for YOUR_COMPANY business tasks.
-model: claude-opus-4-6
 color: secondary
 mode: subagent
 ---
