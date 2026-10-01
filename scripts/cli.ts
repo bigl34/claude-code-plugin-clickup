@@ -1,7 +1,7 @@
 #!/usr/bin/env npx tsx
 
 import { z, createCommand, runCli, cacheCommands, cliTypes, wrapUntrustedField, buildSafeOutput } from "@local/cli-utils";
-import { ClickUpClient } from "./clickup-client.js";
+import { ClickUpClient, type Task } from "./clickup-client.js";
 import { pathToFileURL } from "node:url";
 import { realpathSync } from "node:fs";
 import {
@@ -29,31 +29,59 @@ function parseAssigneeIds(raw: string): number[] {
 const createTaskPayloadShape = {
   name: z.string().min(1).describe("Task name"),
   description: z.string().optional().describe("Task description"),
+  markdownDescription: z.string().optional().describe("Task description in markdown"),
   priority: cliTypes.int(1, 4).optional().describe("Priority (1=urgent, 2=high, 3=normal, 4=low)"),
   status: z.string().optional().describe("Task status"),
   dueDate: cliTypes.int().optional().describe("Due date (Unix timestamp in ms)"),
+  startDate: cliTypes.int().optional().describe("Start date (Unix timestamp in ms)"),
+  allDay: cliTypes.bool().optional().describe("Treat due/start dates as all-day (due_date_time/start_date_time false)"),
+  assignees: z.string().optional().describe("Comma-separated ClickUp user IDs to assign"),
 };
 
-function buildCreateTaskPayload(args: {
+interface CreateTaskArgs {
   name: string;
   description?: string;
+  markdownDescription?: string;
   priority?: number;
   status?: string;
   dueDate?: number;
-}): {
+  startDate?: number;
+  allDay?: boolean;
+  assignees?: string;
+  parent?: string;
+}
+
+interface CreateTaskPayload {
   name: string;
   description?: string;
+  markdown_description?: string;
   priority?: number;
   status?: string;
   due_date?: number;
-} {
-  return {
+  due_date_time?: boolean;
+  start_date?: number;
+  start_date_time?: boolean;
+  assignees?: number[];
+  parent?: string;
+}
+
+function buildCreateTaskPayload(args: CreateTaskArgs): CreateTaskPayload {
+  const payload: CreateTaskPayload = {
     name: args.name,
     description: args.description,
     priority: args.priority,
     status: args.status,
     due_date: args.dueDate,
   };
+  if (args.markdownDescription !== undefined) payload.markdown_description = args.markdownDescription;
+  if (args.startDate !== undefined) payload.start_date = args.startDate;
+  if (args.allDay !== undefined) {
+    if (args.dueDate !== undefined) payload.due_date_time = !args.allDay;
+    if (args.startDate !== undefined) payload.start_date_time = !args.allDay;
+  }
+  if (args.assignees) payload.assignees = parseAssigneeIds(args.assignees);
+  if (args.parent) payload.parent = args.parent;
+  return payload;
 }
 
 function serializeResolutionError(error: CurrentSprintResolutionError) {
@@ -236,6 +264,46 @@ function taskMutationParts(task: unknown, fieldPrefix = "task") {
   };
 }
 
+function taskTreeMetadata(task: Task) {
+  return {
+    parent: task.parent ?? null,
+    top_level_parent: task.top_level_parent ?? null,
+    archived: task.archived ?? false,
+    status_type: task.status?.type,
+    date_created: normalizeClickUpTimestamp(task.date_created),
+    date_updated: normalizeClickUpTimestamp(task.date_updated),
+    date_closed: normalizeClickUpTimestamp(task.date_closed),
+    due_date: normalizeClickUpTimestamp(task.due_date),
+    start_date: normalizeClickUpTimestamp(task.start_date),
+    due_date_ms: task.due_date ? Number(task.due_date) : null,
+    start_date_ms: task.start_date ? Number(task.start_date) : null,
+    assignee_ids: (task.assignees ?? []).map((assignee) => assignee.id),
+    dependencies: (task.dependencies ?? []).map((dependency) => ({
+      task_id: dependency.task_id,
+      depends_on: dependency.depends_on,
+      type: dependency.type,
+    })),
+  };
+}
+
+function presentTaskTree(tasks: Task[], fieldPrefix: string): unknown[] {
+  return tasks.map((task, index) => {
+    const prefix = `${fieldPrefix}[${index}]`;
+    const children = Array.isArray(task.subtasks)
+      ? presentTaskTree(task.subtasks, `${prefix}.subtasks`)
+      : undefined;
+    return {
+      id: task.id,
+      url: task.url,
+      status: wrapMaybeString(`${prefix}.status`, task.status?.status, 200),
+      ...taskTreeMetadata(task),
+      name: wrapMaybeString(`${prefix}.name`, task.name, 500),
+      description: wrapMaybeString(`${prefix}.description`, task.description, 8000),
+      ...(children ? { subtasks: children } : {}),
+    };
+  });
+}
+
 function presentTaskMutation(
   command: string,
   task: unknown,
@@ -374,6 +442,7 @@ export const commands = {
         return {
           id: t.id,
           status: (t.status as Record<string, unknown>)?.status,
+          status_type: (t.status as Record<string, unknown>)?.type,
           priority: (t.priority as Record<string, unknown>)?.priority,
           url: t.url,
           date_created: t.date_created ? new Date(parseInt(t.date_created as string, 10)).toISOString() : null,
@@ -396,9 +465,30 @@ export const commands = {
   "get-task": createCommand(
     z.object({
       id: z.string().min(1).describe("Task ID"),
+      includeSubtasks: cliTypes.bool().optional().describe("Include the nested subtask tree, dates, parent and dependencies"),
     }),
     async (args, client: ClickUpClient) => {
-      const { id } = args as { id: string };
+      const { id, includeSubtasks } = args as { id: string; includeSubtasks?: boolean };
+      if (includeSubtasks) {
+        const tree = await client.getTaskTree(id, { includeMarkdown: true });
+        return buildSafeOutput(
+          {
+            command: "get-task",
+            id: tree.id,
+            status: tree.status?.status,
+            priority: tree.priority?.priority,
+            url: tree.url,
+            points: tree.points ?? null,
+            ...taskTreeMetadata(tree),
+          },
+          {
+            name: wrapUntrustedField("name", tree.name, { maxChars: 500 }),
+            description: wrapUntrustedField("description", tree.description ?? "", { maxChars: 8000 }),
+            markdown_description: wrapUntrustedField("markdown_description", tree.markdown_description ?? "", { maxChars: 8000 }),
+            subtasks: presentTaskTree(tree.subtasks ?? [], "subtasks"),
+          },
+        );
+      }
       const task = await client.getTask(id);
       return buildSafeOutput(
         {
@@ -416,6 +506,53 @@ export const commands = {
       );
     },
     "Get task details by ID",
+    { sideEffect: "read" }
+  ),
+
+  "list-tasks": createCommand(
+    z.object({
+      list: z.string().min(1).describe("List ID"),
+      subtasks: cliTypes.bool().optional().describe("Include subtasks at every depth"),
+      includeClosed: cliTypes.bool().optional().describe("Include closed/done tasks"),
+      archived: cliTypes.bool().optional().describe("Return only archived-flag tasks"),
+      updatedAfter: cliTypes.int(0).optional().describe("Only tasks updated after this Unix timestamp in milliseconds"),
+      page: cliTypes.int(0).optional().describe("Results page (0-indexed)"),
+      allPages: cliTypes.bool().optional().describe("Follow last_page until the list is exhausted"),
+    }),
+    async (args, client: ClickUpClient) => {
+      const { list, subtasks, includeClosed, archived, updatedAfter, page, allPages } = args as {
+        list: string;
+        subtasks?: boolean;
+        includeClosed?: boolean;
+        archived?: boolean;
+        updatedAfter?: number;
+        page?: number;
+        allPages?: boolean;
+      };
+      const options = {
+        subtasks,
+        include_closed: includeClosed,
+        archived,
+        date_updated_gt: updatedAfter,
+      };
+      const listing = allPages
+        ? { tasks: await client.getAllTasksInList(list, options, { bypassCache: true }), last_page: true }
+        : await client.getTasksPage(list, { ...options, page }, { bypassCache: true });
+      const tasks = listing.tasks;
+      const lastPage = listing.last_page;
+      return buildSafeOutput(
+        {
+          command: "list-tasks",
+          list_id: list,
+          count: tasks.length,
+          page: allPages ? null : page ?? 0,
+          last_page: lastPage,
+          all_pages: allPages === true,
+        },
+        { tasks: presentTaskTree(tasks, "tasks") },
+      );
+    },
+    "List tasks in a list with subtask, closed, archived and updated-after filters",
     { sideEffect: "read" }
   ),
 
@@ -453,42 +590,51 @@ export const commands = {
   "create-task": createCommand(
     z.object({
       list: z.string().min(1).describe("List ID"),
+      parent: z.string().optional().describe("Parent task ID (creates a subtask)"),
       ...createTaskPayloadShape,
     }),
     async (args, client: ClickUpClient) => {
-      const { list, name, description, priority, status, dueDate } = args as {
-        list: string;
-        name: string;
-        description?: string;
-        priority?: number;
-        status?: string;
-        dueDate?: number;
-      };
-      const task = await client.createTask(
-        list,
-        buildCreateTaskPayload({ name, description, priority, status, dueDate }),
-      );
-      return presentTaskMutation("create-task", task, { requested_list_id: list });
+      const { list, ...payloadArgs } = args as CreateTaskArgs & { list: string };
+      const task = await client.createTask(list, buildCreateTaskPayload(payloadArgs));
+      return presentTaskMutation("create-task", task, {
+        requested_list_id: list,
+        requested_parent_id: payloadArgs.parent ?? null,
+        parent: task.parent ?? null,
+      });
     },
     "Create a new task",
+    { sideEffect: "write" }
+  ),
+
+  "create-from-template": createCommand(
+    z.object({
+      list: z.string().min(1).describe("List ID"),
+      template: z.string().min(1).describe("Task template ID (t-…)"),
+      name: z.string().min(1).describe("Name for the instantiated root task"),
+    }),
+    async (args, client: ClickUpClient) => {
+      const { list, template, name } = args as { list: string; template: string; name: string };
+      const created = await client.createTaskFromTemplate(list, template, name);
+      const rootTask = created.task ?? { id: created.id };
+      return presentTaskMutation("create-from-template", rootTask, {
+        requested_list_id: list,
+        template_id: template,
+        created_task_id: created.id,
+      });
+    },
+    "Create a task tree from a task template",
     { sideEffect: "write" }
   ),
 
   "create-sprint-task": createCommand(
     z.object(createTaskPayloadShape),
     async (args, client: ClickUpClient) => {
-      const { name, description, priority, status, dueDate } = args as {
-        name: string;
-        description?: string;
-        priority?: number;
-        status?: string;
-        dueDate?: number;
-      };
+      const { status, ...payloadArgs } = args as CreateTaskArgs;
       try {
         const resolvedList = resolveCurrentSprintList(await client.getAllLists() as SprintListInput[]);
         const task = await client.createTask(
           resolvedList.id,
-          buildCreateTaskPayload({ name, description, priority, status: status ?? "to do", dueDate }),
+          buildCreateTaskPayload({ ...payloadArgs, status: status ?? "to do" }),
         );
         const output = presentTaskMutation(
           "create-sprint-task",
@@ -530,6 +676,11 @@ export const commands = {
       priority: cliTypes.int(1, 4).optional().describe("Priority (1=urgent, 2=high, 3=normal, 4=low)"),
       status: z.string().optional().describe("New task status"),
       dueDate: cliTypes.int().optional().describe("Due date (Unix timestamp in ms)"),
+      startDate: cliTypes.int().optional().describe("Start date (Unix timestamp in ms)"),
+      allDay: cliTypes.bool().optional().describe("Treat due/start dates as all-day (due_date_time/start_date_time false)"),
+      markdownDescription: z.string().optional().describe("New task description in markdown"),
+      parent: z.string().optional().describe("Move the task under this parent task ID"),
+      archived: cliTypes.bool().optional().describe("Set or clear the archived flag"),
       list: z.string().optional().describe("Move task to list ID"),
       assigneesAdd: z.string().optional().describe("Comma-separated ClickUp user IDs to assign"),
       assigneesRem: z.string().optional().describe("Comma-separated ClickUp user IDs to unassign"),
@@ -537,13 +688,21 @@ export const commands = {
       points: cliTypes.int(0).optional().describe("Sprint points"),
     }),
     async (args, client: ClickUpClient) => {
-      const { id, name, description, priority, status, dueDate, list, assigneesAdd, assigneesRem, timeEstimate, points } = args as {
+      const {
+        id, name, description, priority, status, dueDate, startDate, allDay, markdownDescription,
+        parent, archived, list, assigneesAdd, assigneesRem, timeEstimate, points,
+      } = args as {
         id: string;
         name?: string;
         description?: string;
         priority?: number;
         status?: string;
         dueDate?: number;
+        startDate?: number;
+        allDay?: boolean;
+        markdownDescription?: string;
+        parent?: string;
+        archived?: boolean;
         list?: string;
         assigneesAdd?: string;
         assigneesRem?: string;
@@ -553,9 +712,17 @@ export const commands = {
       const updates: Record<string, unknown> = {};
       if (name) updates.name = name;
       if (description) updates.description = description;
+      if (markdownDescription !== undefined) updates.markdown_description = markdownDescription;
       if (priority) updates.priority = priority;
       if (status) updates.status = status;
       if (dueDate) updates.due_date = dueDate;
+      if (startDate !== undefined) updates.start_date = startDate;
+      if (allDay !== undefined) {
+        if (dueDate) updates.due_date_time = !allDay;
+        if (startDate !== undefined) updates.start_date_time = !allDay;
+      }
+      if (parent) updates.parent = parent;
+      if (archived !== undefined) updates.archived = archived;
       if (list) updates.list_id = list;
       if (timeEstimate !== undefined) updates.time_estimate = timeEstimate;
       if (points !== undefined) updates.points = points;
@@ -574,6 +741,40 @@ export const commands = {
     },
     "Update a task",
     { sideEffect: "write" }
+  ),
+
+  "add-dependency": createCommand(
+    z.object({
+      id: z.string().min(1).describe("Task ID that will wait on the other task"),
+      dependsOn: z.string().min(1).describe("Task ID the task depends on"),
+    }),
+    async (args, client: ClickUpClient) => {
+      const { id, dependsOn } = args as { id: string; dependsOn: string };
+      await client.addDependency(id, dependsOn);
+      return buildSafeOutput(
+        { command: "add-dependency", task_id: id, depends_on: dependsOn, added: true },
+        {},
+      );
+    },
+    "Add a waiting-on dependency between two tasks",
+    { sideEffect: "write" }
+  ),
+
+  "delete-dependency": createCommand(
+    z.object({
+      id: z.string().min(1).describe("Task ID that currently waits on the other task"),
+      dependsOn: z.string().min(1).describe("Task ID the dependency points at"),
+    }),
+    async (args, client: ClickUpClient) => {
+      const { id, dependsOn } = args as { id: string; dependsOn: string };
+      await client.deleteDependency(id, dependsOn);
+      return buildSafeOutput(
+        { command: "delete-dependency", task_id: id, depends_on: dependsOn, deleted: true },
+        {},
+      );
+    },
+    "Remove a waiting-on dependency between two tasks",
+    { sideEffect: "destructive", requiresConfirmation: true }
   ),
 
   "add-comment": createCommand(

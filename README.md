@@ -3,17 +3,21 @@
 
 ClickUp task management and sprint tracking
 
-![Version](https://img.shields.io/badge/version-1.3.1-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
+![Version](https://img.shields.io/badge/version-1.3.2-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
 
 ## Features
 
 - Task
 - **search** — Search for tasks (fuzzy matching)
-- **get-task** — Get task details by ID
+- **get-task** — Get task details by ID; `--include-subtasks` returns the nested subtask tree with parent, dates and dependencies
 - **get-task-description** — Get task with full markdown description (incl. URL previews)
-- **create-task** — Create a new task
+- **list-tasks** — List tasks in a list (subtasks at every depth, closed, archived-flag, updated-after; `--all-pages` follows `last_page`)
+- **create-task** — Create a new task (or a subtask with `--parent`)
+- **create-from-template** — Instantiate a task template (whole tree) in a list
 - **create-sprint-task** — Create a task in the current User To Dos sprint (defaults status to `to do`)
 - **update-task** — Update a task
+- **add-dependency** — Make `--id` wait on `--depends-on`
+- **delete-dependency** — Remove a waiting-on edge (destructive; requires `--confirm`)
 - **add-comment** — Add a comment to a task
 - **get-comments** — Get comments on a task
 - Space/List
@@ -58,16 +62,20 @@ npm --prefix scripts run cli -- search
 
 ### Task Commands
 
-| Command                | Description                                                                  | Options                                                                                           |
-| ---------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `search`               | Search for tasks (fuzzy matching)                                            | `--query`, `--exclude-closed`, `--list`, `--space`, `--page`                                      |
-| `get-task`             | Get task details by ID                                                       | `--id` (required)                                                                                 |
-| `get-task-description` | Get task with full markdown description (incl. URL previews)                 | `--id` (required)                                                                                 |
-| `create-task`          | Create a new task                                                            | `--list` (required), `--name` (required), `--description`, `--priority`, `--status`, `--due-date` |
-| `create-sprint-task`   | Create a task in the current User To Dos sprint (defaults status to `to do`) | `--name` (required), `--description`, `--priority`, `--status`, `--due-date`                      |
-| `update-task`          | Update a task                                                                | `--id` (required), `--name`, `--description`, `--priority`, `--status`, `--due-date`              |
-| `add-comment`          | Add a comment to a task                                                      | `--id` (required), `--comment` (required)                                                         |
-| `get-comments`         | Get comments on a task                                                       | `--id` (required)                                                                                 |
+| Command                | Description                                                                                                             | Options                                                                                                                                                                                                     |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `search`               | Search for tasks (fuzzy matching)                                                                                       | `--query`, `--exclude-closed`, `--list`, `--space`, `--page`                                                                                                                                                |
+| `get-task`             | Get task details by ID; `--include-subtasks` returns the nested subtask tree with parent, dates and dependencies        | `--id` (required), `--include-subtasks`                                                                                                                                                                     |
+| `get-task-description` | Get task with full markdown description (incl. URL previews)                                                            | `--id` (required)                                                                                                                                                                                           |
+| `list-tasks`           | List tasks in a list (subtasks at every depth, closed, archived-flag, updated-after; `--all-pages` follows `last_page`) | `--list` (required), `--subtasks`, `--include-closed`, `--archived`, `--updated-after`, `--page`, `--all-pages`                                                                                             |
+| `create-task`          | Create a new task (or a subtask with `--parent`)                                                                        | `--list` (required), `--name` (required), `--parent`, `--description`, `--markdown-description`, `--priority`, `--status`, `--due-date`, `--start-date`, `--all-day`, `--assignees`                         |
+| `create-from-template` | Instantiate a task template (whole tree) in a list                                                                      | `--list` (required), `--template` (required, `t-…`), `--name` (required)                                                                                                                                    |
+| `create-sprint-task`   | Create a task in the current User To Dos sprint (defaults status to `to do`)                                            | `--name` (required), `--description`, `--priority`, `--status`, `--due-date`                                                                                                                                |
+| `update-task`          | Update a task                                                                                                           | `--id` (required), `--name`, `--description`, `--markdown-description`, `--priority`, `--status`, `--due-date`, `--start-date`, `--all-day`, `--parent`, `--archived`, `--assignees-add`, `--assignees-rem` |
+| `add-dependency`       | Make `--id` wait on `--depends-on`                                                                                      | `--id` (required), `--depends-on` (required)                                                                                                                                                                |
+| `delete-dependency`    | Remove a waiting-on edge (destructive; requires `--confirm`)                                                            | `--id` (required), `--depends-on` (required), `--confirm`                                                                                                                                                   |
+| `add-comment`          | Add a comment to a task                                                                                                 | `--id` (required), `--comment` (required)                                                                                                                                                                   |
+| `get-comments`         | Get comments on a task                                                                                                  | `--id` (required)                                                                                                                                                                                           |
 
 ### Space/List Commands
 

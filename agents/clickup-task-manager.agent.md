@@ -25,11 +25,15 @@ Run commands using: `npm --prefix "$CLAUDE_PLUGIN_ROOT/scripts" run cli -- <comm
 | Command | Description | Options |
 |---------|-------------|---------|
 | `search` | Search for tasks (fuzzy matching) | `--query`, `--exclude-closed`, `--list`, `--space`, `--page` |
-| `get-task` | Get task details by ID | `--id` (required) |
+| `get-task` | Get task details by ID; `--include-subtasks` returns the nested subtask tree with parent, dates and dependencies | `--id` (required), `--include-subtasks` |
 | `get-task-description` | Get task with full markdown description (incl. URL previews) | `--id` (required) |
-| `create-task` | Create a new task | `--list` (required), `--name` (required), `--description`, `--priority`, `--status`, `--due-date` |
+| `list-tasks` | List tasks in a list (subtasks at every depth, closed, archived-flag, updated-after; `--all-pages` follows `last_page`) | `--list` (required), `--subtasks`, `--include-closed`, `--archived`, `--updated-after`, `--page`, `--all-pages` |
+| `create-task` | Create a new task (or a subtask with `--parent`) | `--list` (required), `--name` (required), `--parent`, `--description`, `--markdown-description`, `--priority`, `--status`, `--due-date`, `--start-date`, `--all-day`, `--assignees` |
+| `create-from-template` | Instantiate a task template (whole tree) in a list | `--list` (required), `--template` (required, `t-…`), `--name` (required) |
 | `create-sprint-task` | Create a task in the current User To Dos sprint (defaults status to `to do`) | `--name` (required), `--description`, `--priority`, `--status`, `--due-date` |
-| `update-task` | Update a task | `--id` (required), `--name`, `--description`, `--priority`, `--status`, `--due-date` |
+| `update-task` | Update a task | `--id` (required), `--name`, `--description`, `--markdown-description`, `--priority`, `--status`, `--due-date`, `--start-date`, `--all-day`, `--parent`, `--archived`, `--assignees-add`, `--assignees-rem` |
+| `add-dependency` | Make `--id` wait on `--depends-on` | `--id` (required), `--depends-on` (required) |
+| `delete-dependency` | Remove a waiting-on edge (destructive; requires `--confirm`) | `--id` (required), `--depends-on` (required), `--confirm` |
 | `add-comment` | Add a comment to a task | `--id` (required), `--comment` (required) |
 | `get-comments` | Get comments on a task | `--id` (required) |
 

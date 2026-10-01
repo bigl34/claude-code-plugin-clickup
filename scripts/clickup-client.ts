@@ -216,7 +216,18 @@ interface User {
   profilePicture?: string;
 }
 
-interface Task {
+export interface TaskDependency {
+  task_id: string;
+  depends_on: string;
+  type: number;
+  date_created?: string;
+  userid?: string;
+  workspace_id?: string;
+  chain_id?: string | null;
+  lag_ms?: number | null;
+}
+
+export interface Task {
   id: string;
   custom_id?: string;
   name: string;
@@ -227,25 +238,40 @@ interface Task {
   orderindex: string;
   date_created: string;
   date_updated: string;
-  date_closed?: string;
-  date_done?: string;
+  date_closed?: string | null;
+  date_done?: string | null;
   creator: User;
   assignees: User[];
   watchers?: User[];
   checklists?: any[];
   tags: { name: string; tag_fg: string; tag_bg: string }[];
-  parent?: string;
+  parent?: string | null;
+  top_level_parent?: string | null;
+  archived?: boolean;
   priority?: { id: string; priority: string; color: string; orderindex: string };
-  due_date?: string;
-  start_date?: string;
+  due_date?: string | null;
+  start_date?: string | null;
   time_estimate?: number;
   time_spent?: number;
   points?: number | null;
   custom_fields?: any[];
+  dependencies?: TaskDependency[];
+  linked_tasks?: unknown[];
+  subtasks?: Task[];
   list: { id: string; name: string };
   folder?: { id: string; name: string };
   space: { id: string };
   url: string;
+}
+
+export interface TaskPage {
+  tasks: Task[];
+  last_page: boolean;
+}
+
+export interface TemplateInstantiation {
+  id: string;
+  task: Task;
 }
 
 interface Comment {
@@ -306,7 +332,6 @@ const cache = new PluginCache({
 export class ClickUpClient {
   private config: ClickUpConfig;
   private baseUrl = "https://api.clickup.com/api/v2";
-  private cacheDisabled: boolean = false;
 
   constructor() {
     const raw = loadServiceConfig("clickup-task-manager");
@@ -326,12 +351,10 @@ export class ClickUpClient {
 
 
   disableCache(): void {
-    this.cacheDisabled = true;
     cache.disable();
   }
 
   enableCache(): void {
-    this.cacheDisabled = false;
     cache.enable();
   }
 
@@ -384,7 +407,11 @@ export class ClickUpClient {
       throw new Error(`ClickUp API error (${response.status}): ${errorText}`);
     }
 
-    return response.json() as Promise<T>;
+    const responseText = await response.text();
+    if (responseText.trim().length === 0) {
+      return {} as T;
+    }
+    return JSON.parse(responseText) as T;
   }
 
   private async fetchResponseWithRetry(
@@ -511,7 +538,7 @@ export class ClickUpClient {
         );
         return result.spaces || [];
       },
-      { ttl: TTL.HOUR, bypassCache: this.cacheDisabled }
+      { ttl: TTL.HOUR }
     );
   }
 
@@ -520,7 +547,7 @@ export class ClickUpClient {
     return cache.getOrFetch(
       cacheKey,
       () => this.request<Space>("GET", `/space/${spaceId}`),
-      { ttl: TTL.HOUR, bypassCache: this.cacheDisabled }
+      { ttl: TTL.HOUR }
     );
   }
 
@@ -536,7 +563,7 @@ export class ClickUpClient {
         );
         return result.folders || [];
       },
-      { ttl: TTL.FIFTEEN_MINUTES, bypassCache: this.cacheDisabled }
+      { ttl: TTL.FIFTEEN_MINUTES }
     );
   }
 
@@ -557,7 +584,7 @@ export class ClickUpClient {
       },
       {
         ttl: TTL.FIFTEEN_MINUTES,
-        bypassCache: this.cacheDisabled || options?.bypassCache,
+        bypassCache: options?.bypassCache,
       }
     );
   }
@@ -573,7 +600,7 @@ export class ClickUpClient {
         );
         return result.lists || [];
       },
-      { ttl: TTL.FIFTEEN_MINUTES, bypassCache: this.cacheDisabled }
+      { ttl: TTL.FIFTEEN_MINUTES }
     );
   }
 
@@ -582,7 +609,7 @@ export class ClickUpClient {
     return cache.getOrFetch(
       cacheKey,
       () => this.request<List>("GET", `/list/${listId}`),
-      { ttl: TTL.FIFTEEN_MINUTES, bypassCache: this.cacheDisabled }
+      { ttl: TTL.FIFTEEN_MINUTES }
     );
   }
 
@@ -654,7 +681,7 @@ export class ClickUpClient {
       },
       {
         ttl: TTL.FIVE_MINUTES,
-        bypassCache: this.cacheDisabled || requestOptions?.bypassCache,
+        bypassCache: requestOptions?.bypassCache,
       }
     );
   }
@@ -702,8 +729,117 @@ export class ClickUpClient {
         const params = includeMarkdown ? "?include_markdown_description=true" : "";
         return this.request<Task>("GET", `/task/${taskId}${params}`);
       },
-      { ttl: TTL.FIVE_MINUTES, bypassCache: this.cacheDisabled }
+      { ttl: TTL.FIVE_MINUTES }
     );
+  }
+
+  async getTaskTree(
+    taskId: string,
+    options?: { includeMarkdown?: boolean },
+    requestOptions?: { bypassCache?: boolean }
+  ): Promise<Task> {
+    const includeMarkdown = options?.includeMarkdown === true;
+    const cacheKey = createCacheKey("task-tree", { id: taskId, markdown: includeMarkdown });
+
+    return cache.getOrFetch(
+      cacheKey,
+      async () => {
+        const params = new URLSearchParams({ include_subtasks: "true" });
+        if (includeMarkdown) params.set("include_markdown_description", "true");
+        return this.request<Task>("GET", `/task/${taskId}?${params.toString()}`);
+      },
+      {
+        ttl: TTL.FIVE_MINUTES,
+        bypassCache: requestOptions?.bypassCache,
+      }
+    );
+  }
+
+  async getTasksPage(
+    listId: string,
+    options?: {
+      archived?: boolean;
+      include_closed?: boolean;
+      page?: number;
+      order_by?: string;
+      reverse?: boolean;
+      subtasks?: boolean;
+      statuses?: string[];
+      date_created_gt?: number;
+      date_updated_gt?: number;
+      date_updated_lt?: number;
+    },
+    requestOptions?: { bypassCache?: boolean }
+  ): Promise<TaskPage> {
+    const cacheParams: Record<string, string | number | boolean | undefined> = {
+      list: listId,
+      archived: options?.archived,
+      include_closed: options?.include_closed,
+      page: options?.page,
+      order_by: options?.order_by,
+      reverse: options?.reverse,
+      subtasks: options?.subtasks,
+      statuses: options?.statuses?.join(","),
+      date_created_gt: options?.date_created_gt,
+      date_updated_gt: options?.date_updated_gt,
+      date_updated_lt: options?.date_updated_lt,
+    };
+    const cacheKey = createCacheKey("tasks-page", cacheParams);
+
+    return cache.getOrFetch(
+      cacheKey,
+      async () => {
+        const params = new URLSearchParams();
+        if (options?.archived !== undefined) params.set("archived", String(options.archived));
+        if (options?.include_closed) params.set("include_closed", "true");
+        if (options?.page !== undefined) params.set("page", String(options.page));
+        if (options?.order_by) params.set("order_by", options.order_by);
+        if (options?.reverse) params.set("reverse", "true");
+        if (options?.subtasks) params.set("subtasks", "true");
+        if (options?.statuses) options.statuses.forEach((status) => params.append("statuses[]", status));
+        if (options?.date_created_gt !== undefined) params.set("date_created_gt", String(options.date_created_gt));
+        if (options?.date_updated_gt !== undefined) params.set("date_updated_gt", String(options.date_updated_gt));
+        if (options?.date_updated_lt !== undefined) params.set("date_updated_lt", String(options.date_updated_lt));
+
+        const queryString = params.toString();
+        const endpoint = `/list/${listId}/task${queryString ? `?${queryString}` : ""}`;
+        const result = await this.request<{ tasks?: Task[]; last_page?: boolean }>("GET", endpoint);
+        const tasks = result.tasks ?? [];
+        const lastPage = result.last_page ?? tasks.length < CLICKUP_TASK_PAGE_SIZE;
+        return { tasks, last_page: lastPage };
+      },
+      {
+        ttl: TTL.FIVE_MINUTES,
+        bypassCache: requestOptions?.bypassCache,
+      }
+    );
+  }
+
+  async getAllTasksInList(
+    listId: string,
+    options?: {
+      include_closed?: boolean;
+      subtasks?: boolean;
+      date_updated_gt?: number;
+      order_by?: string;
+      reverse?: boolean;
+    },
+    requestOptions?: { bypassCache?: boolean; maxPages?: number }
+  ): Promise<Task[]> {
+    const maxPages = requestOptions?.maxPages ?? 50;
+    const collected: Task[] = [];
+    let page = 0;
+    let lastPage = false;
+    while (!lastPage) {
+      if (page >= maxPages) {
+        throw new Error(`ClickUp list ${listId} exceeded ${maxPages} pages`);
+      }
+      const result = await this.getTasksPage(listId, { ...options, page }, { bypassCache: requestOptions?.bypassCache });
+      collected.push(...result.tasks);
+      lastPage = result.last_page;
+      page += 1;
+    }
+    return collected;
   }
 
   async searchTasks(
@@ -761,7 +897,7 @@ export class ClickUpClient {
         const result = await this.request<{ tasks: Task[] }>("GET", endpoint);
         return result.tasks || [];
       },
-      { ttl: TTL.FIVE_MINUTES, bypassCache: this.cacheDisabled }
+      { ttl: TTL.FIVE_MINUTES }
     );
   }
 
@@ -802,9 +938,9 @@ export class ClickUpClient {
       assignees?: { add?: number[]; rem?: number[] };
       status?: string;
       priority?: number;
-      due_date?: number;
+      due_date?: number | null;
       due_date_time?: boolean;
-      start_date?: number;
+      start_date?: number | null;
       start_date_time?: boolean;
       parent?: string;
       time_estimate?: number;
@@ -827,6 +963,32 @@ export class ClickUpClient {
     cache.invalidatePattern(/^search/);
   }
 
+  async createTaskFromTemplate(
+    listId: string,
+    templateId: string,
+    name: string
+  ): Promise<TemplateInstantiation> {
+    const result = await this.request<TemplateInstantiation>(
+      "POST",
+      `/list/${listId}/taskTemplate/${encodeURIComponent(templateId)}`,
+      { name }
+    );
+    cache.invalidatePattern(/^tasks/);
+    cache.invalidatePattern(/^search/);
+    return result;
+  }
+
+  async addDependency(taskId: string, dependsOn: string): Promise<void> {
+    await this.request<unknown>("POST", `/task/${taskId}/dependency`, { depends_on: dependsOn });
+    cache.invalidatePattern(/^task/);
+  }
+
+  async deleteDependency(taskId: string, dependsOn: string): Promise<void> {
+    const params = new URLSearchParams({ depends_on: dependsOn });
+    await this.request<unknown>("DELETE", `/task/${taskId}/dependency?${params.toString()}`);
+    cache.invalidatePattern(/^task/);
+  }
+
 
   async getTaskComments(taskId: string, options?: { start?: number; start_id?: string }): Promise<Comment[]> {
     const cacheKey = createCacheKey("comments", { task: taskId, ...options });
@@ -844,7 +1006,7 @@ export class ClickUpClient {
         const result = await this.request<{ comments: Comment[] }>("GET", endpoint);
         return result.comments || [];
       },
-      { ttl: TTL.FIVE_MINUTES, bypassCache: this.cacheDisabled }
+      { ttl: TTL.FIVE_MINUTES }
     );
   }
 
@@ -892,7 +1054,7 @@ export class ClickUpClient {
         const result = await this.request<{ data: TimeEntry[] }>("GET", endpoint);
         return result.data || [];
       },
-      { ttl: TTL.FIVE_MINUTES, bypassCache: this.cacheDisabled }
+      { ttl: TTL.FIVE_MINUTES }
     );
   }
 
@@ -929,7 +1091,7 @@ export class ClickUpClient {
         const result = await this.request<{ user: User }>("GET", "/user");
         return result.user;
       },
-      { ttl: TTL.HOUR, bypassCache: this.cacheDisabled }
+      { ttl: TTL.HOUR }
     );
   }
 
@@ -943,7 +1105,7 @@ export class ClickUpClient {
         );
         return (result.members || []).map(m => m.user);
       },
-      { ttl: TTL.HOUR, bypassCache: this.cacheDisabled }
+      { ttl: TTL.HOUR }
     );
   }
 
@@ -981,11 +1143,15 @@ export class ClickUpClient {
   getTools(): Array<{ name: string; description: string }> {
     return [
       { name: "search", description: "Search for tasks by query" },
-      { name: "get-task", description: "Get a specific task by ID" },
+      { name: "get-task", description: "Get a specific task by ID (--include-subtasks for the nested tree)" },
       { name: "get-task-description", description: "Get task with full markdown description" },
-      { name: "create-task", description: "Create a new task in a list" },
+      { name: "list-tasks", description: "List tasks in a list with subtask/closed/archived/updated-after filters" },
+      { name: "create-task", description: "Create a new task in a list (--parent for a subtask)" },
+      { name: "create-from-template", description: "Create a task tree from a task template" },
       { name: "create-sprint-task", description: "Create a new task in the current User To Dos sprint" },
       { name: "update-task", description: "Update an existing task" },
+      { name: "add-dependency", description: "Add a waiting-on dependency between two tasks" },
+      { name: "delete-dependency", description: "Remove a waiting-on dependency between two tasks" },
       { name: "add-comment", description: "Add a comment to a task" },
       { name: "get-comments", description: "Get comments on a task" },
       { name: "search-spaces", description: "Search/list spaces" },
